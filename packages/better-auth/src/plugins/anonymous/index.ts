@@ -45,10 +45,22 @@ async function resolveAnonymousSession(ctx: GenericEndpointContext): Promise<{
 	session: Session & Record<string, any>;
 	user: UserWithAnonymous & Record<string, any>;
 } | null> {
-	const cookieSession = await getSessionFromCtx<{
-		isAnonymous: boolean | null;
-	}>(ctx, { disableRefresh: true });
-	if (cookieSession?.user.isAnonymous) {
+	// Look the session up directly instead of through `getSessionFromCtx`. When
+	// the request still carries a cookie for a session that no longer exists,
+	// `getSession` expires the session cookie, which would also drop the new
+	// session cookie this response is about to set.
+	const sessionToken = await ctx.getSignedCookie(
+		ctx.context.authCookies.sessionToken.name,
+		ctx.context.secret,
+	);
+	const cookieSession = sessionToken
+		? await ctx.context.internalAdapter.findSession(sessionToken)
+		: null;
+	if (
+		cookieSession &&
+		cookieSession.session.expiresAt > new Date() &&
+		cookieSession.user.isAnonymous
+	) {
 		return {
 			session: cookieSession.session,
 			user: { ...cookieSession.user, isAnonymous: true },

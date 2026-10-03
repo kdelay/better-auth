@@ -12,11 +12,12 @@ import {
 	it,
 	vi,
 } from "vitest";
-import * as apiModule from "../../api";
+import { parseSetCookieHeader } from "../../cookies";
 import { signJWT } from "../../crypto";
 import { getTestInstance } from "../../test-utils/test-instance";
 import { DEFAULT_SECRET } from "../../utils/constants";
 import { genericOAuth } from "../generic-oauth";
+import { createCookieHeaders } from "../test-utils/cookie-builder";
 import { anonymous } from ".";
 import { anonymousClient } from "./client";
 
@@ -183,6 +184,39 @@ describe("anonymous", async () => {
 		});
 		expect(linkAccountFn).toHaveBeenCalledWith(expect.any(Object));
 		linkAccountFn.mockClear();
+	});
+
+	/**
+	 * @see https://github.com/better-auth/better-auth/issues/11533
+	 */
+	it("keeps the new session cookie when signing in with a stale session cookie", async () => {
+		const staleHeaders = new Headers();
+		await client.signIn.email(testUser, {
+			onSuccess: sessionSetter(staleHeaders),
+		});
+		await auth.api.revokeSessions({ headers: staleHeaders });
+
+		let setCookie = "";
+		await client.signIn.email(testUser, {
+			headers: staleHeaders,
+			onSuccess(context) {
+				setCookie = context.response.headers.get("set-cookie") ?? "";
+			},
+		});
+		const sessionToken = parseSetCookieHeader(setCookie).get(
+			"better-auth.session_token",
+		)?.value;
+		expect(sessionToken).toBeTruthy();
+
+		const newHeaders = new Headers({
+			cookie: `better-auth.session_token=${sessionToken}`,
+		});
+		const session = await client.getSession({
+			fetchOptions: {
+				headers: newHeaders,
+			},
+		});
+		expect(session.data?.user.email).toBe(testUser.email);
 	});
 
 	it("should link in social sign on", async () => {
@@ -572,14 +606,25 @@ describe("anonymous", async () => {
 	});
 
 	describe("anonymous cleanup safeguards", () => {
-		function createMiddlewareContext({
+		const previousAnonymousSession = {
+			user: {
+				id: "anon-user",
+				isAnonymous: true,
+			},
+			session: {
+				token: "old-token",
+				expiresAt: new Date(Date.now() + 60_000),
+			},
+		};
+
+		async function createMiddlewareContext({
 			newSessionUser,
 			deleteUser,
 		}: {
 			newSessionUser: Record<string, any>;
 			deleteUser: ReturnType<typeof vi.fn>;
 		}) {
-			return {
+			const ctx = {
 				path: "/sign-in/anonymous",
 				context: {
 					responseHeaders: new Headers({
@@ -608,6 +653,7 @@ describe("anonymous", async () => {
 					},
 					internalAdapter: {
 						deleteUser,
+						findSession: vi.fn().mockResolvedValue(previousAnonymousSession),
 					},
 					options: {},
 					secret: "secret",
@@ -621,29 +667,21 @@ describe("anonymous", async () => {
 				setCookie: vi.fn(),
 				setSignedCookie: vi.fn(),
 			} as any;
+			ctx.headers = await createCookieHeaders(ctx.context, "old-token");
+			return ctx;
 		}
 
 		it("does not delete when the new session is still anonymous", async () => {
 			const plugin = anonymous();
 			const handler = plugin.hooks?.after?.[0]?.handler;
 			const deleteUser = vi.fn();
-			const ctx = createMiddlewareContext({
+			const ctx = await createMiddlewareContext({
 				newSessionUser: {
 					id: "anon-user",
 					isAnonymous: true,
 				},
 				deleteUser,
 			});
-
-			vi.spyOn(apiModule, "getSessionFromCtx").mockResolvedValue({
-				user: {
-					id: "anon-user",
-					isAnonymous: true,
-				},
-				session: {
-					token: "old-token",
-				},
-			} as any);
 
 			await handler?.(ctx);
 
@@ -654,23 +692,13 @@ describe("anonymous", async () => {
 			const plugin = anonymous();
 			const handler = plugin.hooks?.after?.[0]?.handler;
 			const deleteUser = vi.fn();
-			const ctx = createMiddlewareContext({
+			const ctx = await createMiddlewareContext({
 				newSessionUser: {
 					id: "linked-user",
 					isAnonymous: false,
 				},
 				deleteUser,
 			});
-
-			vi.spyOn(apiModule, "getSessionFromCtx").mockResolvedValue({
-				user: {
-					id: "anon-user",
-					isAnonymous: true,
-				},
-				session: {
-					token: "old-token",
-				},
-			} as any);
 
 			await handler?.(ctx);
 
